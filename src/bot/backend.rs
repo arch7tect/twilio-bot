@@ -1,12 +1,10 @@
-use reqwest::{Client, ClientBuilder, StatusCode};
+use reqwest::{Client, ClientBuilder, StatusCode, Method};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, atomic::{AtomicUsize, AtomicU64, Ordering}};
 use log::{debug, error, info};
-
-use crate::bot::session::SessionStore;
-use crate::config::Config;
-use crate::bot::ws_client::WebSocketManager;
+use std::time::{SystemTime, UNIX_EPOCH};
+use std::fmt;
 
 /// Response from the backend when opening a session
 #[derive(Debug, Deserialize)]
@@ -29,15 +27,19 @@ pub enum BackendError {
     AuthError(String),
     ApiError(String),
     JsonError(serde_json::Error),
+    CircuitBreakerOpen,
+    RetryExhausted(Box<BackendError>),
 }
 
-impl std::fmt::Display for BackendError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for BackendError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             BackendError::RequestError(err) => write!(f, "Request error: {}", err),
             BackendError::AuthError(msg) => write!(f, "Authentication error: {}", msg),
             BackendError::ApiError(msg) => write!(f, "API error: {}", msg),
             BackendError::JsonError(err) => write!(f, "JSON error: {}", err),
+            BackendError::CircuitBreakerOpen => write!(f, "Circuit breaker is open"),
+            BackendError::RetryExhausted(err) => write!(f, "Retry exhausted: {}", err),
         }
     }
 }
@@ -56,24 +58,96 @@ impl From<serde_json::Error> for BackendError {
     }
 }
 
+/// Circuit breaker for preventing cascading failures
+pub struct CircuitBreaker {
+    failures: AtomicUsize,
+    last_failure: AtomicU64,
+    threshold: usize,
+    reset_timeout_ms: u64,
+}
+
+impl CircuitBreaker {
+    /// Create a new circuit breaker
+    pub fn new(threshold: usize, reset_timeout_ms: u64) -> Self {
+        CircuitBreaker {
+            failures: AtomicUsize::new(0),
+            last_failure: AtomicU64::new(0),
+            threshold,
+            reset_timeout_ms,
+        }
+    }
+    
+    /// Record a successful operation
+    pub fn record_success(&self) {
+        self.failures.store(0, Ordering::SeqCst);
+    }
+    
+    /// Record a failed operation
+    pub fn record_failure(&self) {
+        self.failures.fetch_add(1, Ordering::SeqCst);
+        self.last_failure.store(
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+            Ordering::SeqCst
+        );
+    }
+    
+    /// Check if the circuit breaker is open (preventing requests)
+    pub fn is_open(&self) -> bool {
+        let failures = self.failures.load(Ordering::SeqCst);
+        
+        if failures >= self.threshold {
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64;
+            let last = self.last_failure.load(Ordering::SeqCst);
+            
+            // Circuit is open if we're within the reset timeout
+            if now - last < self.reset_timeout_ms {
+                return true;
+            }
+            
+            // Otherwise, allow a test request
+            self.failures.store(0, Ordering::SeqCst);
+        }
+        
+        false
+    }
+}
+
 /// Client for interacting with the backend API
 pub struct BackendClient {
     client: Client,
     base_url: String,
     authorization_token: Option<String>,
+    circuit_breaker: Option<Arc<CircuitBreaker>>,
 }
 
 impl BackendClient {
     /// Create a new backend client
-    pub fn new(base_url: &str, authorization_token: Option<String>) -> Result<Self, BackendError> {
+    pub fn new(
+        base_url: &str, 
+        authorization_token: Option<String>,
+        enable_circuit_breaker: bool,
+    ) -> Result<Self, BackendError> {
         let client = ClientBuilder::new()
             .build()
             .map_err(BackendError::from)?;
+        
+        let circuit_breaker = if enable_circuit_breaker {
+            Some(Arc::new(CircuitBreaker::new(5, 30000))) // 5 failures, 30s reset
+        } else {
+            None
+        };
             
         Ok(BackendClient {
             client,
             base_url: base_url.to_string(),
             authorization_token,
+            circuit_breaker,
         })
     }
     
@@ -86,6 +160,182 @@ impl BackendClient {
         }
     }
     
+    /// Generic API request method
+    async fn make_api_request<T: serde::de::DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> Result<T, BackendError> {
+        // Check circuit breaker
+        if let Some(cb) = &self.circuit_breaker {
+            if cb.is_open() {
+                return Err(BackendError::CircuitBreakerOpen);
+            }
+        }
+        
+        let url = format!("{}{}", self.base_url, path);
+        
+        let mut request = self.client.request(method, &url)
+            .header("Content-Type", "application/json")
+            .header("Accept", "application/json");
+            
+        request = self.add_auth_header(request);
+        
+        if let Some(body_data) = body {
+            request = request.json(&body_data);
+        }
+        
+        let response = match request.send().await {
+            Ok(resp) => resp,
+            Err(e) => {
+                // Record failure
+                if let Some(cb) = &self.circuit_breaker {
+                    cb.record_failure();
+                }
+                return Err(BackendError::RequestError(e));
+            }
+        };
+        
+        let status = response.status();
+        
+        if status == StatusCode::FORBIDDEN {
+            return Err(BackendError::AuthError("Permission denied".to_string()));
+        } else if !status.is_success() {
+            let error_text = response.text().await?;
+            
+            // Record failure
+            if let Some(cb) = &self.circuit_breaker {
+                cb.record_failure();
+            }
+            
+            return Err(BackendError::ApiError(format!("API error: {} ({})", error_text, status)));
+        }
+        
+        // Record success
+        if let Some(cb) = &self.circuit_breaker {
+            cb.record_success();
+        }
+        
+        match response.json().await {
+            Ok(result) => Ok(result),
+            Err(e) => Err(BackendError::JsonError(e)),
+        }
+    }
+    
+    /// Run with retry capability
+    pub async fn run_with_retry(
+        &self,
+        session_id: &str,
+        message: &str,
+        kwargs: HashMap<String, serde_json::Value>,
+        max_retries: usize,
+        base_delay_ms: u64,
+    ) -> Result<serde_json::Value, BackendError> {
+        let mut attempts = 0;
+        let mut last_error = None;
+        
+        while attempts <= max_retries {
+            match self.run(session_id, message, kwargs.clone()).await {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    // Don't retry certain errors
+                    match &e {
+                        BackendError::AuthError(_) => return Err(e),
+                        BackendError::CircuitBreakerOpen => return Err(e),
+                        _ => {
+                            attempts += 1;
+                            last_error = Some(e);
+                            
+                            if attempts <= max_retries {
+                                let delay = base_delay_ms * 2u64.pow(attempts as u32 - 1);
+                                debug!("Retrying backend call, attempt {}/{} after {}ms", 
+                                       attempts, max_retries, delay);
+                                tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        
+        Err(BackendError::RetryExhausted(Box::new(
+            last_error.unwrap_or(BackendError::ApiError("Maximum retries exceeded".to_string()))
+        )))
+    }
+    
+    /// Run a command on an existing session
+    pub async fn run_command(
+        &self,
+        session_id: &str,
+        command: &str,
+        args: Vec<String>,
+    ) -> Result<serde_json::Value, BackendError> {
+        let path = format!("/session/{}/command", session_id);
+        
+        let body = serde_json::json!({
+            "command": command,
+            "args": args
+        });
+        
+        self.make_api_request(Method::POST, &path, Some(body)).await
+    }
+    
+    /// Run a message on an existing session
+    pub async fn run(
+        &self,
+        session_id: &str,
+        message: &str,
+        kwargs: HashMap<String, serde_json::Value>,
+    ) -> Result<serde_json::Value, BackendError> {
+        let path = format!("/session/{}/run", session_id);
+        
+        let body = serde_json::json!({
+            "message": message,
+            "kwargs": kwargs
+        });
+        
+        self.make_api_request(Method::POST, &path, Some(body)).await
+    }
+    
+    /// Start a message processing on an existing session
+    pub async fn start(
+        &self,
+        session_id: &str,
+        message: &str,
+    ) -> Result<serde_json::Value, BackendError> {
+        let path = format!("/session/{}/start", session_id);
+        
+        let body = serde_json::json!({
+            "message": message,
+            "kwargs": {}
+        });
+        
+        self.make_api_request(Method::POST, &path, Some(body)).await
+    }
+    
+    /// Commit a message processing on an existing session
+    pub async fn commit(
+        &self,
+        session_id: &str,
+    ) -> Result<serde_json::Value, BackendError> {
+        let path = format!("/session/{}/commit", session_id);
+        let body = serde_json::json!({});
+        
+        self.make_api_request(Method::POST, &path, Some(body)).await
+    }
+    
+    /// Rollback a message processing on an existing session
+    pub async fn rollback(
+        &self,
+        session_id: &str,
+    ) -> Result<serde_json::Value, BackendError> {
+        let path = format!("/session/{}/rollback", session_id);
+        let body = serde_json::json!({});
+        
+        self.make_api_request(Method::POST, &path, Some(body)).await
+    }
+    
     /// Open a new session with the backend
     pub async fn open_session(
         &self,
@@ -95,12 +345,8 @@ impl BackendClient {
         conversation_id: Option<&str>,
         args: Vec<String>,
         kwargs: HashMap<String, serde_json::Value>,
-        config: &Config,
-        sessions: Arc<Mutex<SessionStore>>,
-        ws_manager: Arc<WebSocketManager>,
     ) -> Result<SessionResponse, BackendError> {
-        let url = format!("{}/session", self.base_url);
-        debug!("Opening session for user {} of type {}", user_id, bot_type);
+        let path = "/session";
         
         let body = serde_json::json!({
             "user_id": user_id,
@@ -111,213 +357,15 @@ impl BackendClient {
             "kwargs": kwargs
         });
         
-        let request = self.client.post(&url)
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json");
-            
-        let request = self.add_auth_header(request);
+        let session_response: SessionResponse = self.make_api_request(
+            Method::POST, 
+            path, 
+            Some(body)
+        ).await?;
         
-        let response = request
-            .json(&body)
-            .send()
-            .await?;
-            
-        let status = response.status();
-        
-        if status == StatusCode::FORBIDDEN {
-            return Err(BackendError::AuthError("Permission denied".to_string()));
-        } else if !status.is_success() {
-            let error_text = response.text().await?;
-            return Err(BackendError::ApiError(format!("Failed to open session: {} ({})", error_text, status)));
-        }
-        
-        let session_response: SessionResponse = response.json().await?;
         info!("Opened session with ID: {}", session_response.session.session_id);
         
-        // Create a WebSocket client for this session
-        if !config.backend_ws_url.is_empty() {
-            ws_manager.get_or_create_client(
-                &session_response.session.session_id,
-                &config.backend_ws_url,
-                sessions.clone(),
-            ).await;
-        }
-        
         Ok(session_response)
-    }
-    
-    /// Run a command on an existing session
-    pub async fn run_command(
-        &self,
-        session_id: &str,
-        command: &str,
-        args: Vec<String>,
-    ) -> Result<serde_json::Value, BackendError> {
-        let url = format!("{}/session/{}/command", self.base_url, session_id);
-        debug!("Running command '{}' on session {}", command, session_id);
-        
-        let body = serde_json::json!({
-            "command": command,
-            "args": args
-        });
-        
-        let request = self.client.post(&url)
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json");
-            
-        let request = self.add_auth_header(request);
-        
-        let response = request
-            .json(&body)
-            .send()
-            .await?;
-            
-        let status = response.status();
-        
-        if !status.is_success() {
-            let error_text = response.text().await?;
-            return Err(BackendError::ApiError(format!("Failed to run command: {} ({})", error_text, status)));
-        }
-        
-        let result: serde_json::Value = response.json().await?;
-        Ok(result)
-    }
-    
-    /// Run a message on an existing session
-    pub async fn run(
-        &self,
-        session_id: &str,
-        message: &str,
-        kwargs: HashMap<String, serde_json::Value>,
-    ) -> Result<serde_json::Value, BackendError> {
-        let url = format!("{}/session/{}/run", self.base_url, session_id);
-        debug!("Running message on session {}: {}", session_id, message);
-        
-        let body = serde_json::json!({
-            "message": message,
-            "kwargs": kwargs
-        });
-        
-        let request = self.client.post(&url)
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json");
-            
-        let request = self.add_auth_header(request);
-        
-        let response = request
-            .json(&body)
-            .send()
-            .await?;
-            
-        let status = response.status();
-        
-        if !status.is_success() {
-            let error_text = response.text().await?;
-            return Err(BackendError::ApiError(format!("Failed to run message: {} ({})", error_text, status)));
-        }
-        
-        let result: serde_json::Value = response.json().await?;
-        Ok(result)
-    }
-    
-    /// Start a message processing on an existing session
-    pub async fn start(
-        &self,
-        session_id: &str,
-        message: &str,
-    ) -> Result<serde_json::Value, BackendError> {
-        let url = format!("{}/session/{}/start", self.base_url, session_id);
-        debug!("Starting message on session {}: {}", session_id, message);
-        
-        let body = serde_json::json!({
-            "message": message,
-            "kwargs": {}
-        });
-        
-        let request = self.client.post(&url)
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json");
-            
-        let request = self.add_auth_header(request);
-        
-        let response = request
-            .json(&body)
-            .send()
-            .await?;
-            
-        let status = response.status();
-        
-        if !status.is_success() {
-            let error_text = response.text().await?;
-            return Err(BackendError::ApiError(format!("Failed to start message: {} ({})", error_text, status)));
-        }
-        
-        let result: serde_json::Value = response.json().await?;
-        Ok(result)
-    }
-    
-    /// Commit a message processing on an existing session
-    pub async fn commit(
-        &self,
-        session_id: &str,
-    ) -> Result<serde_json::Value, BackendError> {
-        let url = format!("{}/session/{}/commit", self.base_url, session_id);
-        debug!("Committing session {}", session_id);
-        
-        let body = serde_json::json!({});
-        
-        let request = self.client.post(&url)
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json");
-            
-        let request = self.add_auth_header(request);
-        
-        let response = request
-            .json(&body)
-            .send()
-            .await?;
-            
-        let status = response.status();
-        
-        if !status.is_success() {
-            let error_text = response.text().await?;
-            return Err(BackendError::ApiError(format!("Failed to commit: {} ({})", error_text, status)));
-        }
-        
-        let result: serde_json::Value = response.json().await?;
-        Ok(result)
-    }
-    
-    /// Rollback a message processing on an existing session
-    pub async fn rollback(
-        &self,
-        session_id: &str,
-    ) -> Result<serde_json::Value, BackendError> {
-        let url = format!("{}/session/{}/rollback", self.base_url, session_id);
-        debug!("Rolling back session {}", session_id);
-        
-        let body = serde_json::json!({});
-        
-        let request = self.client.post(&url)
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json");
-            
-        let request = self.add_auth_header(request);
-        
-        let response = request
-            .json(&body)
-            .send()
-            .await?;
-            
-        let status = response.status();
-        
-        if !status.is_success() {
-            let error_text = response.text().await?;
-            return Err(BackendError::ApiError(format!("Failed to rollback: {} ({})", error_text, status)));
-        }
-        
-        let result: serde_json::Value = response.json().await?;
-        Ok(result)
     }
     
     /// Update an existing session
@@ -326,8 +374,7 @@ impl BackendClient {
         session_id: &str,
         conversation_id: Option<&str>,
     ) -> Result<serde_json::Value, BackendError> {
-        let url = format!("{}/session/{}", self.base_url, session_id);
-        debug!("Updating session {} with conversation ID {:?}", session_id, conversation_id);
+        let path = format!("/session/{}", session_id);
         
         let mut body = serde_json::json!({});
         
@@ -337,26 +384,7 @@ impl BackendClient {
             });
         }
         
-        let request = self.client.put(&url)
-            .header("Content-Type", "application/json")
-            .header("Accept", "application/json");
-            
-        let request = self.add_auth_header(request);
-        
-        let response = request
-            .json(&body)
-            .send()
-            .await?;
-            
-        let status = response.status();
-        
-        if !status.is_success() {
-            let error_text = response.text().await?;
-            return Err(BackendError::ApiError(format!("Failed to update session: {} ({})", error_text, status)));
-        }
-        
-        let result: serde_json::Value = response.json().await?;
-        Ok(result)
+        self.make_api_request(Method::PUT, &path, Some(body)).await
     }
     
     /// Close an existing session
@@ -365,29 +393,15 @@ impl BackendClient {
         session_id: &str,
         status: Option<&str>,
     ) -> Result<(), BackendError> {
-        let mut url = format!("{}/session/{}", self.base_url, session_id);
+        let mut path = format!("/session/{}", session_id);
         
         if let Some(status_str) = status {
-            url = format!("{}?status={}", url, status_str);
+            path = format!("{}?status={}", path, status_str);
         }
         
         debug!("Closing session {} with status {:?}", session_id, status);
         
-        let request = self.client.delete(&url)
-            .header("Accept", "application/json");
-            
-        let request = self.add_auth_header(request);
-        
-        let response = request
-            .send()
-            .await?;
-            
-        let status_code = response.status();
-        
-        if !status_code.is_success() {
-            let error_text = response.text().await?;
-            return Err(BackendError::ApiError(format!("Failed to close session: {} ({})", error_text, status_code)));
-        }
+        let _: serde_json::Value = self.make_api_request(Method::DELETE, &path, None).await?;
         
         info!("Successfully closed session {}", session_id);
         Ok(())

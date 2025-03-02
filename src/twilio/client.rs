@@ -18,6 +18,7 @@ pub enum TwilioError {
     RequestError(ReqwestError),
     ApiError(String),
     StatusError(u16, String),
+    RetryExhausted(Box<TwilioError>),
 }
 
 impl fmt::Display for TwilioError {
@@ -26,6 +27,7 @@ impl fmt::Display for TwilioError {
             TwilioError::RequestError(err) => write!(f, "Request error: {}", err),
             TwilioError::ApiError(err) => write!(f, "API error: {}", err),
             TwilioError::StatusError(status, msg) => write!(f, "Status {} error: {}", status, msg),
+            TwilioError::RetryExhausted(err) => write!(f, "Retry exhausted: {}", err),
         }
     }
 }
@@ -133,6 +135,41 @@ impl TwilioClient {
         Ok(call)
     }
     
+    /// Create a new outbound call with retry capability
+    pub async fn create_call_with_retry(
+        &self,
+        to: &str,
+        from: &str,
+        twiml: &str,
+        status_callback: &str,
+        max_retries: usize,
+        base_delay_ms: u64,
+    ) -> Result<TwilioCall, TwilioError> {
+        let mut attempts = 0;
+        let mut last_error = None;
+        
+        while attempts <= max_retries {
+            match self.create_call(to, from, twiml, status_callback).await {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    attempts += 1;
+                    last_error = Some(e);
+                    
+                    if attempts <= max_retries {
+                        let delay = base_delay_ms * 2u64.pow(attempts as u32 - 1);
+                        debug!("Retrying Twilio call creation, attempt {}/{} after {}ms", 
+                              attempts, max_retries, delay);
+                        tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
+                    }
+                }
+            }
+        }
+        
+        Err(TwilioError::RetryExhausted(Box::new(
+            last_error.unwrap_or(TwilioError::ApiError("Maximum retries exceeded".to_string()))
+        )))
+    }
+    
     /// Update an existing call with new TwiML
     pub async fn update_call(&self, call_sid: &str, twiml: &str) -> Result<(), TwilioError> {
         let url = format!("{}/Calls/{}.json", self.base_url(), call_sid);
@@ -156,6 +193,39 @@ impl TwilioClient {
         
         debug!("Successfully updated call {}", call_sid);
         Ok(())
+    }
+    
+    /// Update an existing call with new TwiML with retry capability
+    pub async fn update_call_with_retry(
+        &self,
+        call_sid: &str,
+        twiml: &str,
+        max_retries: usize,
+        base_delay_ms: u64,
+    ) -> Result<(), TwilioError> {
+        let mut attempts = 0;
+        let mut last_error = None;
+        
+        while attempts <= max_retries {
+            match self.update_call(call_sid, twiml).await {
+                Ok(result) => return Ok(result),
+                Err(e) => {
+                    attempts += 1;
+                    last_error = Some(e);
+                    
+                    if attempts <= max_retries {
+                        let delay = base_delay_ms * 2u64.pow(attempts as u32 - 1);
+                        debug!("Retrying call update, attempt {}/{} after {}ms", 
+                              attempts, max_retries, delay);
+                        tokio::time::sleep(tokio::time::Duration::from_millis(delay)).await;
+                    }
+                }
+            }
+        }
+        
+        Err(TwilioError::RetryExhausted(Box::new(
+            last_error.unwrap_or(TwilioError::ApiError("Maximum retries exceeded".to_string()))
+        )))
     }
     
     /// List phone numbers for a specific phone number

@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Utc, Duration};
 use regex::Regex;
 use rocket::tokio::sync::mpsc::{channel, Receiver, Sender};
 use serde_json::Value;
@@ -36,6 +36,8 @@ pub struct Session {
     pub message_rx: Receiver<MessageType>,
     /// Session creation time
     pub creation_time: DateTime<Utc>,
+    /// Last activity time
+    pub last_activity_time: DateTime<Utc>,
     /// Whether speech is currently being processed
     pub speech_in_progress: bool,
     /// Whether a run operation is in progress
@@ -54,6 +56,7 @@ impl Session {
     /// Create a new session
     pub fn new(user_id: String, name: String, bot_type: String, conversation_id: Option<String>) -> Self {
         let (tx, rx) = channel(100);
+        let now = Utc::now();
         
         Session {
             session_id: Uuid::new_v4().to_string(),
@@ -63,7 +66,8 @@ impl Session {
             conversation_id,
             message_tx: tx,
             message_rx: rx,
-            creation_time: Utc::now(),
+            creation_time: now,
+            last_activity_time: now,
             speech_in_progress: false,
             run_in_progress: false,
             unstable_speech_result: None,
@@ -95,6 +99,16 @@ impl Session {
     pub fn ends_with_sentence_punctuation(text: &str) -> bool {
         let re = Regex::new(r".*[.!?]$").unwrap();
         re.is_match(text.trim())
+    }
+    
+    /// Update the last activity time
+    pub fn update_activity_time(&mut self) {
+        self.last_activity_time = Utc::now();
+    }
+    
+    /// Check if the session has expired
+    pub fn is_expired(&self, max_age: Duration) -> bool {
+        Utc::now() - self.last_activity_time > max_age
     }
 }
 
@@ -137,7 +151,12 @@ impl SessionStore {
     
     /// Get a mutable reference to a session by session ID
     pub fn get_session_mut(&mut self, session_id: &str) -> Option<&mut Session> {
-        self.sessions.get_mut(session_id)
+        if let Some(session) = self.sessions.get_mut(session_id) {
+            session.update_activity_time();
+            Some(session)
+        } else {
+            None
+        }
     }
     
     /// Get a session by conversation ID
@@ -154,7 +173,12 @@ impl SessionStore {
             None => return None,
         };
         
-        self.sessions.get_mut(&session_id)
+        if let Some(session) = self.sessions.get_mut(&session_id) {
+            session.update_activity_time();
+            Some(session)
+        } else {
+            None
+        }
     }
     
     /// Remove a session from the store
@@ -171,4 +195,41 @@ impl SessionStore {
         self.conversation_to_session.insert(conversation_id.clone(), session_id.clone());
         self.session_to_conversation.insert(session_id, conversation_id);
     }
+    
+    /// Clean up expired sessions
+    pub fn cleanup_expired_sessions(&mut self, max_age: Duration) {
+        let expired_sessions: Vec<String> = self.sessions
+            .iter()
+            .filter(|(_, session)| session.is_expired(max_age))
+            .map(|(id, _)| id.clone())
+            .collect();
+        
+        for session_id in expired_sessions {
+            info!("Removing expired session: {}", session_id);
+            self.remove_session(&session_id);
+        }
+    }
+}
+
+/// Start a periodic session cleanup task
+pub fn start_session_cleanup_task(
+    session_store: Arc<tokio::sync::RwLock<SessionStore>>, 
+    interval_minutes: u64,
+    max_age_minutes: i64
+) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(interval_minutes * 60));
+        
+        loop {
+            interval.tick().await;
+            let max_age = Duration::minutes(max_age_minutes);
+            
+            if let Ok(mut store) = session_store.write().await {
+                store.cleanup_expired_sessions(max_age);
+                debug!("Session cleanup completed");
+            } else {
+                error!("Failed to acquire write lock for session cleanup");
+            }
+        }
+    });
 }
