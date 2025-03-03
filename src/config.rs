@@ -34,7 +34,7 @@ impl TwilioConfig {
             return Err("Webhook URL cannot be empty".to_string());
         }
         
-        if self.webhook_port == 0 || self.webhook_port > 65535 {
+        if self.webhook_port == 0 {
             return Err("Webhook port must be a valid port number".to_string());
         }
         

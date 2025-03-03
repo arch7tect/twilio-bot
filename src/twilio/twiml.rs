@@ -168,35 +168,39 @@ impl<'a> Default for GatherOptions<'a> {
 /// Helper function to create a voice response with a Gather verb
 pub fn create_voice_response(
     text: &str,
-    config: &crate::config::Config,
+    config: &crate::config::TwilioConfig,
     timeout: u32,
     speech_timeout: &str
 ) -> String {
+    // Create longer-lived strings first
+    let action_url = format!("{}{}", config.webhook_url, "/transcription_callback");
+    let partial_callback_url = format!("{}{}", config.webhook_url, "/partial_callback");
+
     let gather_options = GatherOptions {
         input: Some("speech"),
-        action: Some(&format!("{}{}", config.webhook_url, "/transcription_callback")),
+        action: Some(&action_url),
         method: Some("POST"),
         timeout: Some(timeout),
         speech_timeout: Some(speech_timeout),
         barge_in: Some(true),
-        partial_result_callback: Some(&format!("{}{}", config.webhook_url, "/partial_callback")),
+        partial_result_callback: Some(&partial_callback_url),
         speech_model: Some(&config.speech_model),
-        language: config.twilio_language.as_deref(),
+        language: config.language.as_deref(),
         say_text: Some(text),
-        voice: Some(&config.twilio_voice),
+        voice: Some(&config.voice),
     };
-    
+
     TwiML::new()
         .gather(gather_options)
         .build()
 }
 
 /// Helper function to create a hangup response
-pub fn create_hangup_response(text: Option<&str>, config: &crate::config::Config) -> String {
+pub fn create_hangup_response(text: Option<&str>, config: &crate::config::TwilioConfig) -> String {
     let mut twiml = TwiML::new();
     
     if let Some(message) = text {
-        twiml = twiml.say(message, &config.twilio_voice, config.twilio_language.as_deref());
+        twiml = twiml.say(message, &config.voice, config.language.as_deref());
     }
     
     twiml.hangup().build()

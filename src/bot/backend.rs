@@ -219,7 +219,7 @@ impl BackendClient {
         
         match response.json().await {
             Ok(result) => Ok(result),
-            Err(e) => Err(BackendError::JsonError(e)),
+            Err(e) => Err(BackendError::RequestError(e)),
         }
     }
     

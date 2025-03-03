@@ -131,7 +131,12 @@ impl SessionStore {
             session_to_conversation: HashMap::new(),
         }
     }
-    
+
+    /// Get the session ID for a given conversation ID
+    pub fn get_session_id_by_conversation(&self, conversation_id: &str) -> Option<String> {
+        self.conversation_to_session.get(conversation_id).cloned()
+    }
+
     /// Add a session to the store
     pub fn add_session(&mut self, session: Session) -> String {
         let session_id = session.session_id.clone();
@@ -213,23 +218,21 @@ impl SessionStore {
 
 /// Start a periodic session cleanup task
 pub fn start_session_cleanup_task(
-    session_store: Arc<tokio::sync::RwLock<SessionStore>>, 
+    session_store: Arc<tokio::sync::RwLock<SessionStore>>,
     interval_minutes: u64,
     max_age_minutes: i64
 ) {
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(interval_minutes * 60));
-        
+
         loop {
             interval.tick().await;
             let max_age = Duration::minutes(max_age_minutes);
-            
-            if let Ok(mut store) = session_store.write().await {
-                store.cleanup_expired_sessions(max_age);
-                debug!("Session cleanup completed");
-            } else {
-                error!("Failed to acquire write lock for session cleanup");
-            }
+
+            // Get write lock without pattern matching
+            let mut store = session_store.write().await;
+            store.cleanup_expired_sessions(max_age);
+            debug!("Session cleanup completed");
         }
     });
 }

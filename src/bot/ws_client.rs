@@ -104,26 +104,25 @@ impl WebSocketClient {
                                     
                                     // Parse the message
                                     if let Ok(ws_msg) = serde_json::from_str::<WsMessage>(&text) {
-                                        if let Ok(mut store) = sessions_clone.write().await {
-                                            if let Some(session) = store.get_session_mut(&session_id_clone) {
-                                                match ws_msg.r#type.as_str() {
-                                                    "message" => {
-                                                        if let Err(e) = session.message_tx.try_send(MessageType::Text(ws_msg.message)) {
-                                                            error!("Failed to forward WebSocket message: {}", e);
-                                                        }
-                                                    },
-                                                    "eos" => {
-                                                        if let Err(e) = session.message_tx.try_send(MessageType::EndOfStream) {
-                                                            error!("Failed to forward EOS: {}", e);
-                                                        }
-                                                    },
-                                                    "timeout" => {
-                                                        if let Err(e) = session.message_tx.try_send(MessageType::EndOfConversation) {
-                                                            error!("Failed to forward timeout: {}", e);
-                                                        }
-                                                    },
-                                                    _ => debug!("Unknown WebSocket message type: {}", ws_msg.r#type),
-                                                }
+                                        let mut store = sessions_clone.write().await;
+                                        if let Some(session) = store.get_session_mut(&session_id_clone) {
+                                            match ws_msg.r#type.as_str() {
+                                                "message" => {
+                                                    if let Err(e) = session.message_tx.try_send(MessageType::Text(ws_msg.message)) {
+                                                        error!("Failed to forward WebSocket message: {}", e);
+                                                    }
+                                                },
+                                                "eos" => {
+                                                    if let Err(e) = session.message_tx.try_send(MessageType::EndOfStream) {
+                                                        error!("Failed to forward EOS: {}", e);
+                                                    }
+                                                },
+                                                "timeout" => {
+                                                    if let Err(e) = session.message_tx.try_send(MessageType::EndOfConversation) {
+                                                        error!("Failed to forward timeout: {}", e);
+                                                    }
+                                                },
+                                                _ => debug!("Unknown WebSocket message type: {}", ws_msg.r#type),
                                             }
                                         }
                                     }

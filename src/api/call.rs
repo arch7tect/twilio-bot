@@ -1,9 +1,9 @@
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use log::{debug, error};
 use rocket::{post, serde::json::Json, State, http::Status};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 
-use crate::bot::session::SessionStore;
 use crate::config::Config;
 use crate::twilio::client::TwilioClient;
 use crate::twilio::twiml::create_voice_response;
@@ -26,10 +26,10 @@ pub async fn make_call(
     
     // Create Twilio client
     let twilio_client = match TwilioClient::new(
-        config.twilio_account_sid.clone(),
-        config.twilio_auth_token.clone(),
-        config.twilio_region.clone(),
-        config.twilio_edge.clone()
+        config.inner().twilio.account_sid.clone(),
+        config.inner().twilio.auth_token.clone(),
+        config.inner().twilio.region.clone(),
+        config.inner().twilio.edge.clone()
     ) {
         Ok(client) => client,
         Err(e) => {
@@ -39,14 +39,16 @@ pub async fn make_call(
     };
     
     // Create empty TwiML response
-    let twiml = create_voice_response("", &config, config.default_timeout, "auto");
+    let twiml = create_voice_response("", &config.inner().twilio, config.inner().twilio.default_timeout, "auto");
     
-    // Make the call
-    let call = match twilio_client.create_call(
+    // Make the call with retry
+    let call = match twilio_client.create_call_with_retry(
         &request.to_number,
-        &config.from_number,
+        &config.inner().twilio.from_number,
         &twiml,
-        &format!("{}{}", config.webhook_url, "/status_callback")
+        &format!("{}{}", config.inner().twilio.webhook_url, "/status_callback"),
+        config.inner().backend.retry_attempts,
+        config.inner().backend.retry_base_delay_ms
     ).await {
         Ok(call) => call,
         Err(e) => {

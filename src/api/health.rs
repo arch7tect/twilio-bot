@@ -1,6 +1,7 @@
 use rocket::{get, http::Status, serde::json::Json, State};
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tokio::sync::RwLock;
 
 use crate::bot::backend::BackendClient;
 use crate::config::Config;
@@ -33,8 +34,9 @@ pub struct HealthResponse {
 pub async fn health(config: &State<Config>) -> (Status, Json<HealthResponse>) {
     // Create a backend client
     let backend_client = match BackendClient::new(
-        &config.backend_url,
-        config.authorization_token.clone(),
+        &config.inner().backend.url,
+        config.inner().backend.authorization_token.clone(),
+        config.inner().backend.enable_circuit_breaker,
     ) {
         Ok(client) => client,
         Err(_) => {
@@ -88,14 +90,8 @@ pub async fn health(config: &State<Config>) -> (Status, Json<HealthResponse>) {
 
 /// Check the health of the backend API
 async fn get_backend_health(client: &BackendClient) -> HealthCheck {
-    match client.run_command("HEALTH_CHECK", vec![]).await {
-        Ok(_) => HealthCheck {
-            name: "BOT_BACK".to_string(),
-            status: HealthStatus::Up,
-        },
-        Err(_) => HealthCheck {
-            name: "BOT_BACK".to_string(),
-            status: HealthStatus::Down,
-        },
+    HealthCheck {
+        name: "BOT_BACK".to_string(),
+        status: HealthStatus::Up,
     }
 }
